@@ -3,7 +3,7 @@
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Registry, Token};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::str::from_utf8;
 
@@ -12,6 +12,33 @@ const SERVER: Token = Token(0);
 
 // Some data we'll send over the connection.
 const DATA: &[u8] = b"Hello world!\n";
+
+/// A connection and its send queue.
+///
+/// Mio reports readiness edge-triggered: it tells us when a socket *becomes*
+/// writable, not that it *is* writable. A single `write` may accept only part
+/// of a message, so the connection itself must remember the unsent remainder
+/// and resume sending on the next writable event.
+struct Connection {
+    stream: TcpStream,
+    /// Bytes accepted from the application but not yet written to the socket.
+    outbox: VecDeque<u8>,
+}
+
+impl Connection {
+    fn new(stream: TcpStream) -> Connection {
+        Connection {
+            stream,
+            outbox: VecDeque::new(),
+        }
+    }
+
+    /// Queue `data` for sending. The actual write happens in `flush_outbox`,
+    /// either right away or when the socket becomes writable.
+    fn queue_data(&mut self, data: &[u8]) {
+        self.outbox.extend(data);
+    }
+}
 
 #[cfg(not(target_os = "wasi"))]
 fn main() -> io::Result<()> {
@@ -30,7 +57,7 @@ fn main() -> io::Result<()> {
     poll.registry()
         .register(&mut server, SERVER, Interest::READABLE)?;
 
-    // Map of `Token` -> `TcpStream`.
+    // Map of `Token` -> `Connection`.
     let mut connections = HashMap::new();
     // Unique token for each incoming connection.
     let mut unique_token = Token(SERVER.0 + 1);
@@ -52,7 +79,7 @@ fn main() -> io::Result<()> {
                 SERVER => loop {
                     // Received an event for the TCP server socket, which
                     // indicates we can accept an connection.
-                    let (mut connection, address) = match server.accept() {
+                    let (connection, address) = match server.accept() {
                         Ok((connection, address)) => (connection, address),
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             // If we get a `WouldBlock` error we know our
@@ -71,8 +98,12 @@ fn main() -> io::Result<()> {
                     println!("Accepted connection from: {address}");
 
                     let token = next(&mut unique_token);
+                    let mut connection = Connection::new(connection);
+                    // Greet the client. The send queue is non-empty, so we
+                    // also listen for writable events until it is flushed.
+                    connection.queue_data(DATA);
                     poll.registry().register(
-                        &mut connection,
+                        &mut connection.stream,
                         token,
                         Interest::READABLE.add(Interest::WRITABLE),
                     )?;
@@ -89,7 +120,7 @@ fn main() -> io::Result<()> {
                     };
                     if done {
                         if let Some(mut connection) = connections.remove(&token) {
-                            poll.registry().deregister(&mut connection)?;
+                            poll.registry().deregister(&mut connection.stream)?;
                         }
                     }
                 }
@@ -107,30 +138,20 @@ fn next(current: &mut Token) -> Token {
 /// Returns `true` if the connection is done.
 fn handle_connection_event(
     registry: &Registry,
-    connection: &mut TcpStream,
+    connection: &mut Connection,
     event: &Event,
 ) -> io::Result<bool> {
     if event.is_writable() {
-        // We can (maybe) write to the connection.
-        match connection.write(DATA) {
-            // We want to write the entire `DATA` buffer in a single go. If we
-            // write less we'll return a short write error (same as
-            // `io::Write::write_all` does).
-            Ok(n) if n < DATA.len() => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(_) => {
-                // After we've written something we'll reregister the connection
-                // to only respond to readable events.
-                registry.reregister(connection, event.token(), Interest::READABLE)?
-            }
-            // Would block "errors" are the OS's way of saying that the
-            // connection is not actually ready to perform this I/O operation.
-            Err(ref err) if would_block(err) => {}
-            // Got interrupted (how rude!), we'll try again.
-            Err(ref err) if interrupted(err) => {
-                return handle_connection_event(registry, connection, event)
-            }
-            // Other errors we'll consider fatal.
-            Err(err) => return Err(err),
+        // We can (maybe) write to the connection. Flush as much of the send
+        // queue as the kernel accepts right now; whatever doesn't fit stays
+        // queued and we'll resume on the next writable event.
+        flush_outbox(connection)?;
+
+        if connection.outbox.is_empty() {
+            // The send queue is drained. Stop listening for writable events:
+            // with nothing to send they'd only wake us up to do nothing,
+            // spinning the CPU on an idle connection.
+            registry.reregister(&mut connection.stream, event.token(), Interest::READABLE)?;
         }
     }
 
@@ -140,7 +161,7 @@ fn handle_connection_event(
         let mut bytes_read = 0;
         // We can (maybe) read from the connection.
         loop {
-            match connection.read(&mut received_data[bytes_read..]) {
+            match connection.stream.read(&mut received_data[bytes_read..]) {
                 Ok(0) => {
                     // Reading 0 bytes means the other side has closed the
                     // connection or is done writing, then so are we.
@@ -169,6 +190,21 @@ fn handle_connection_event(
             } else {
                 println!("Received (none UTF-8) data: {received_data:?}");
             }
+
+            // Echo the data back. It goes through the send queue like any
+            // other outgoing message, so a slow client can't lose the tail
+            // of it to a partial write.
+            connection.queue_data(received_data);
+            flush_outbox(connection)?;
+            if !connection.outbox.is_empty() {
+                // Couldn't send everything right now. Register for writable
+                // events so we resume once the kernel buffer drains.
+                registry.reregister(
+                    &mut connection.stream,
+                    event.token(),
+                    Interest::READABLE.add(Interest::WRITABLE),
+                )?;
+            }
         }
 
         if connection_closed {
@@ -178,6 +214,33 @@ fn handle_connection_event(
     }
 
     Ok(false)
+}
+
+/// Write as much of the send queue as the socket accepts without blocking.
+///
+/// A short write is not an error: the unwritten remainder stays in
+/// `connection.outbox` and is retried on the next writable event (or the
+/// next time more data is queued).
+fn flush_outbox(connection: &mut Connection) -> io::Result<()> {
+    while !connection.outbox.is_empty() {
+        match connection.stream.write(connection.outbox.as_slices().0) {
+            // A zero-length write means the socket can't make progress at
+            // all; treat it like `io::Write::write_all` does.
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                connection.outbox.drain(..n);
+            }
+            // Would block "errors" are the OS's way of saying that the
+            // connection is not actually ready to perform this I/O operation.
+            // The rest of the queue stays put until the next writable event.
+            Err(ref err) if would_block(err) => break,
+            // Got interrupted (how rude!), we'll try again.
+            Err(ref err) if interrupted(err) => continue,
+            // Other errors we'll consider fatal.
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 fn would_block(err: &io::Error) -> bool {

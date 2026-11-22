@@ -3,15 +3,25 @@
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Registry, Token};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::str::from_utf8;
+use std::time::Duration;
 
 // Setup some tokens to allow us to identify which event is for which socket.
 const SERVER: Token = Token(0);
 
 // Some data we'll send over the connection.
 const DATA: &[u8] = b"Hello world!\n";
+
+/// Maximum number of reads to handle for a single connection before giving
+/// other connections a chance to make progress.
+const MAX_READS_PER_EVENT: usize = 32;
+
+struct ConnectionState {
+    done: bool,
+    read_pending: bool,
+}
 
 #[cfg(not(target_os = "wasi"))]
 fn main() -> io::Result<()> {
@@ -32,6 +42,9 @@ fn main() -> io::Result<()> {
 
     // Map of `Token` -> `TcpStream`.
     let mut connections = HashMap::new();
+    // Connections that still have data to read after hitting the per-event
+    // read limit.
+    let mut pending_reads = VecDeque::new();
     // Unique token for each incoming connection.
     let mut unique_token = Token(SERVER.0 + 1);
 
@@ -40,7 +53,13 @@ fn main() -> io::Result<()> {
     println!("You'll see our welcome message and anything you type will be printed here.");
 
     loop {
-        if let Err(err) = poll.poll(&mut events, None) {
+        // Don't block while there is queued work from a previous event.
+        let timeout = if pending_reads.is_empty() {
+            None
+        } else {
+            Some(Duration::ZERO)
+        };
+        if let Err(err) = poll.poll(&mut events, timeout) {
             if interrupted(&err) {
                 continue;
             }
@@ -81,17 +100,42 @@ fn main() -> io::Result<()> {
                 },
                 token => {
                     // Maybe received an event for a TCP connection.
-                    let done = if let Some(connection) = connections.get_mut(&token) {
+                    let state = if let Some(connection) = connections.get_mut(&token) {
                         handle_connection_event(poll.registry(), connection, event)?
                     } else {
                         // Sporadic events happen, we can safely ignore them.
-                        false
+                        ConnectionState {
+                            done: false,
+                            read_pending: false,
+                        }
                     };
-                    if done {
+                    if state.done {
                         if let Some(mut connection) = connections.remove(&token) {
                             poll.registry().deregister(&mut connection)?;
                         }
+                        pending_reads.retain(|pending| *pending != token);
+                    } else if state.read_pending {
+                        if !pending_reads.contains(&token) {
+                            pending_reads.push_back(token);
+                        }
+                    } else {
+                        pending_reads.retain(|pending| *pending != token);
                     }
+                }
+            }
+        }
+
+        // Resume one connection at a time so a busy socket can't monopolise
+        // the event loop and starve the others.
+        if let Some(token) = pending_reads.pop_front() {
+            if let Some(connection) = connections.get_mut(&token) {
+                let state = read_connection(connection)?;
+                if state.done {
+                    if let Some(mut connection) = connections.remove(&token) {
+                        poll.registry().deregister(&mut connection)?;
+                    }
+                } else if state.read_pending {
+                    pending_reads.push_back(token);
                 }
             }
         }
@@ -104,12 +148,11 @@ fn next(current: &mut Token) -> Token {
     Token(next)
 }
 
-/// Returns `true` if the connection is done.
 fn handle_connection_event(
     registry: &Registry,
     connection: &mut TcpStream,
     event: &Event,
-) -> io::Result<bool> {
+) -> io::Result<ConnectionState> {
     if event.is_writable() {
         // We can (maybe) write to the connection.
         match connection.write(DATA) {
@@ -135,49 +178,66 @@ fn handle_connection_event(
     }
 
     if event.is_readable() {
-        let mut connection_closed = false;
-        let mut received_data = vec![0; 4096];
-        let mut bytes_read = 0;
-        // We can (maybe) read from the connection.
-        loop {
-            match connection.read(&mut received_data[bytes_read..]) {
-                Ok(0) => {
-                    // Reading 0 bytes means the other side has closed the
-                    // connection or is done writing, then so are we.
-                    connection_closed = true;
-                    break;
-                }
-                Ok(n) => {
-                    bytes_read += n;
-                    if bytes_read == received_data.len() {
-                        received_data.resize(received_data.len() + 1024, 0);
-                    }
-                }
-                // Would block "errors" are the OS's way of saying that the
-                // connection is not actually ready to perform this I/O operation.
-                Err(ref err) if would_block(err) => break,
-                Err(ref err) if interrupted(err) => continue,
-                // Other errors we'll consider fatal.
-                Err(err) => return Err(err),
-            }
-        }
+        return read_connection(connection);
+    }
 
-        if bytes_read != 0 {
-            let received_data = &received_data[..bytes_read];
-            if let Ok(str_buf) = from_utf8(received_data) {
-                println!("Received data: {}", str_buf.trim_end());
-            } else {
-                println!("Received (none UTF-8) data: {received_data:?}");
-            }
-        }
+    Ok(ConnectionState {
+        done: false,
+        read_pending: false,
+    })
+}
 
-        if connection_closed {
-            println!("Connection closed");
-            return Ok(true);
+/// Read until the socket would block, or until this connection has used its
+/// share of the current event loop iteration.
+fn read_connection(connection: &mut TcpStream) -> io::Result<ConnectionState> {
+    let mut connection_closed = false;
+    let mut received_data = vec![0; 4096];
+    let mut bytes_read = 0;
+    let mut reads = 0;
+
+    while reads < MAX_READS_PER_EVENT {
+        match connection.read(&mut received_data[bytes_read..]) {
+            Ok(0) => {
+                // Reading 0 bytes means the other side has closed the
+                // connection or is done writing, then so are we.
+                connection_closed = true;
+                break;
+            }
+            Ok(n) => {
+                bytes_read += n;
+                reads += 1;
+                if bytes_read == received_data.len() {
+                    received_data.resize(received_data.len() + 1024, 0);
+                }
+            }
+            // Would block "errors" are the OS's way of saying that the
+            // connection is not actually ready to perform this I/O operation.
+            Err(ref err) if would_block(err) => break,
+            Err(ref err) if interrupted(err) => continue,
+            // Other errors we'll consider fatal.
+            Err(err) => return Err(err),
         }
     }
 
-    Ok(false)
+    if bytes_read != 0 {
+        let received_data = &received_data[..bytes_read];
+        if let Ok(str_buf) = from_utf8(received_data) {
+            println!("Received data: {}", str_buf.trim_end());
+        } else {
+            println!("Received (none UTF-8) data: {received_data:?}");
+        }
+    }
+
+    if connection_closed {
+        println!("Connection closed");
+    }
+
+    Ok(ConnectionState {
+        done: connection_closed,
+        // Hitting the limit doesn't prove that the socket is drained, so keep
+        // the connection queued for another batch.
+        read_pending: !connection_closed && reads == MAX_READS_PER_EVENT,
+    })
 }
 
 fn would_block(err: &io::Error) -> bool {

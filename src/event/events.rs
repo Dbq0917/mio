@@ -107,6 +107,22 @@ impl Events {
         self.inner.capacity()
     }
 
+    /// Returns the number of `Event` values currently held by `self`.
+    #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Moves all events from `other` into `self`, leaving `other` empty.
+    ///
+    /// This is used by [`crate::Poll::poll_all`] to collect the events
+    /// returned by successive calls to the system selector without growing the
+    /// buffer passed to each individual call.
+    #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
+    pub(crate) fn append(&mut self, other: &mut Events) {
+        self.inner.append(&mut other.inner);
+    }
+
     /// Returns `true` if `self` contains no `Event` values.
     ///
     /// # Examples

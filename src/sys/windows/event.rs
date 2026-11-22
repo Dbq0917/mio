@@ -156,6 +156,14 @@ impl Events {
         self.events.len()
     }
 
+    /// Moves all events from `other` into `self`, leaving `other` empty.
+    ///
+    /// The `statuses` buffer is only used as scratch space while polling, so
+    /// it doesn't need to be moved.
+    pub fn append(&mut self, other: &mut Events) {
+        self.events.append(&mut other.events);
+    }
+
     pub fn get(&self, idx: usize) -> Option<&Event> {
         self.events.get(idx)
     }

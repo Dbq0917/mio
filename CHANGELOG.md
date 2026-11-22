@@ -1,3 +1,9 @@
+# Unreleased
+
+* Add `Poll::poll_all`, which follows a truncated poll with additional
+  zero-timeout calls so that a burst of ready descriptors is collected in a
+  single round instead of remaining queued in the kernel.
+
 # 1.2.5
 
 * Add support for wasm32-unknown-emscripten

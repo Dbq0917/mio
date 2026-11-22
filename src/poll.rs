@@ -438,6 +438,54 @@ impl Poll {
     pub fn poll(&mut self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
         self.registry.selector.select(events.sys(), timeout)
     }
+
+    /// Wait for readiness events, collecting all currently pending events.
+    ///
+    /// This is the same as [`Poll::poll`], except that when more descriptors
+    /// are ready than `events.capacity()` allows a single call to return, the
+    /// remaining pending events are fetched immediately with additional
+    /// non-blocking calls instead of being left in the kernel for the next
+    /// call. This avoids the head-of-line latency that occurs when a small
+    /// event buffer is reused while hundreds of descriptors become ready at
+    /// once.
+    ///
+    /// The buffer passed to each individual system call keeps the capacity
+    /// provided by the caller, so the common case still copies at most
+    /// `events.capacity()` events. The collection only grows (across separate
+    /// buffers) when a burst actually exceeds that capacity, and it shrinks
+    /// back as the extra buffers are dropped once the burst has been drained.
+    ///
+    /// The `timeout` only applies to the first call; the additional calls use
+    /// a zero timeout and return once no more events are pending. Note that,
+    /// just as with [`Poll::poll`], the returned events may exceed
+    /// `events.capacity()` on some platforms.
+    ///
+    /// [`Poll::poll`]: struct.Poll.html#method.poll
+    pub fn poll_all(&mut self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
+        // Only used by the draining loop below, which is disabled on WASI.
+        #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
+        let capacity = events.capacity();
+        self.registry.selector.select(events.sys(), timeout)?;
+
+        // WASI's `poll_oneoff` returns an event for every subscription, so a
+        // zero-timeout follow-up call would keep reporting the same
+        // descriptors and never terminate.
+        #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
+        if capacity != 0 && events.len() == capacity {
+            let mut more = Events::with_capacity(capacity);
+            loop {
+                self.registry
+                    .selector
+                    .select(more.sys(), Some(Duration::ZERO))?;
+                if more.is_empty() {
+                    break;
+                }
+                events.append(&mut more);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(all(

@@ -723,6 +723,106 @@ fn poll_erroneous_registration() {
     assert_error(registry.deregister(&mut source), "deregister");
 }
 
+// A burst of ready descriptors must not be truncated by the caller's event
+// buffer capacity: `Poll::poll_all` keeps polling with zero-timeout calls
+// until every pending event has been collected. This reproduces the
+// head-of-line latency problem where a fixed eight-slot buffer left hundreds
+// of ready descriptors waiting in the kernel for later poll rounds.
+#[cfg(not(target_os = "wasi"))]
+#[test]
+fn poll_all_drains_every_ready_descriptor() {
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    init();
+
+    const NUM_CLIENTS: usize = 256;
+    const CAPACITY: usize = 8;
+
+    let listener = net::TcpListener::bind(any_local_address()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let accept_handle = thread::spawn(move || {
+        for _ in 0..NUM_CLIENTS {
+            listener.accept().unwrap();
+        }
+    });
+
+    let mut poll = Poll::new().unwrap();
+    let mut clients = Vec::with_capacity(NUM_CLIENTS);
+    for index in 0..NUM_CLIENTS {
+        let mut client = TcpStream::connect(addr).unwrap();
+        poll.registry()
+            .register(&mut client, Token(index), Interest::WRITABLE)
+            .unwrap();
+        clients.push(client);
+    }
+
+    // Give every connection time to establish and become ready in one burst.
+    sleep(Duration::from_millis(100));
+
+    // Reproduce the capacity ceiling: a single `poll` only hands back the
+    // first batch and leaves the rest pending in the kernel.
+    let mut events = Events::with_capacity(CAPACITY);
+    poll.poll(&mut events, Some(Duration::from_millis(100)))
+        .unwrap();
+    let first_batch: HashSet<usize> = events.iter().map(|event| event.token().0).collect();
+    assert!(!first_batch.is_empty());
+
+    // `poll_all` collects the whole burst using an eight-slot buffer per
+    // system call, finishing the entire batch in a single, fast round.
+    let mut all_events = Events::with_capacity(CAPACITY);
+    let start = Instant::now();
+    poll.poll_all(&mut all_events, Some(Duration::from_millis(100)))
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    let remaining: HashSet<usize> = all_events.iter().map(|event| event.token().0).collect();
+    assert!(first_batch.is_disjoint(&remaining));
+    assert_eq!(first_batch.union(&remaining).count(), NUM_CLIENTS);
+    assert!(elapsed < Duration::from_secs(1));
+
+    // The burst is fully drained: another non-blocking poll returns nothing.
+    poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
+    assert!(events.is_empty());
+
+    drop(clients);
+    accept_handle.join().unwrap();
+}
+
+// Below the capacity ceiling `poll_all` behaves like a single `poll` call and
+// does not require any extra rounds.
+#[cfg(not(target_os = "wasi"))]
+#[test]
+fn poll_all_below_capacity() {
+    init();
+
+    let listener = net::TcpListener::bind(any_local_address()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mut poll = Poll::new().unwrap();
+    let mut streams: Vec<TcpStream> = (0..3)
+        .map(|index| {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            poll.registry()
+                .register(&mut stream, Token(index), Interest::WRITABLE)
+                .unwrap();
+            stream
+        })
+        .collect();
+
+    let mut events = Events::with_capacity(16);
+    poll.poll_all(&mut events, Some(Duration::from_millis(100)))
+        .unwrap();
+    assert_eq!(events.iter().count(), 3);
+
+    poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
+    assert!(events.is_empty());
+
+    streams.clear();
+    drop(listener);
+}
+
 /// Assert that `result` is an error and the formatted error (via
 /// `fmt::Display`) equals `expected_msg`.
 pub fn assert_error<T, E: fmt::Display>(result: Result<T, E>, expected_msg: &str) {

@@ -50,6 +50,7 @@ compile_error!("This wasm target is unsupported by mio (only the WASI and Emscri
 #[macro_use]
 mod macros;
 
+pub mod connection;
 mod interest;
 mod poll;
 mod sys;
@@ -67,6 +68,7 @@ cfg_net! {
     pub mod net;
 }
 
+pub use connection::{AllocError, ConnectionId, ConnectionIdAllocator};
 #[doc(no_inline)]
 pub use event::Events;
 pub use interest::Interest;
